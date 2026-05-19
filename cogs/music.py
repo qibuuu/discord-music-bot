@@ -24,11 +24,16 @@ YTDL_OPTIONS = {
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
     "extract_flat": False,
+    "age_limit": 100,
+    "geo_bypass": True,
 }
 
+FFMPEG_BEFORE = (
+    "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin"
+)
 FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
+    "before_options": FFMPEG_BEFORE,
+    "options": "-vn -bufsize 64k",
 }
 
 
@@ -36,7 +41,7 @@ FFMPEG_OPTIONS = {
 class Song:
     title: str
     url: str
-    stream_url: str
+    webpage_url: str
     duration: int
     thumbnail: Optional[str]
     requester: discord.Member
@@ -76,27 +81,39 @@ class Music(commands.Cog):
         func = functools.partial(self.ytdl.extract_info, query, download=False)
         return await loop.run_in_executor(None, func)
 
+    async def get_stream_url(self, song: Song) -> Optional[str]:
+        """Re-extract to get a fresh stream URL right before playing."""
+        try:
+            data = await self.extract_info(song.webpage_url or song.url)
+            if "entries" in data:
+                data = data["entries"][0]
+            return data.get("url")
+        except Exception:
+            logger.exception("Failed to get stream URL for: %s", song.title)
+            return None
+
     async def create_song(self, data: dict, requester: discord.Member) -> Song:
         if "entries" in data:
             data = data["entries"][0]
         return Song(
             title=data.get("title", "Unknown"),
-            url=data.get("webpage_url", ""),
-            stream_url=data.get("url", ""),
+            url=data.get("url", ""),
+            webpage_url=data.get("webpage_url", ""),
             duration=data.get("duration", 0) or 0,
             thumbnail=data.get("thumbnail"),
             requester=requester,
         )
 
-    def play_next(self, guild: discord.Guild):
+    def play_next(self, guild: discord.Guild, error: Exception = None):
+        if error:
+            logger.error("Playback error: %s", error)
+
         player = self.get_player(guild.id)
 
         if player.loop and player.current:
-            source = discord.PCMVolumeTransformer(
-                discord.FFmpegPCMAudio(player.current.stream_url, **FFMPEG_OPTIONS),
-                volume=player.volume,
+            asyncio.run_coroutine_threadsafe(
+                self._play_song(guild, player, player.current), self.bot.loop
             )
-            guild.voice_client.play(source, after=lambda e: self.play_next(guild))
             return
 
         if not player.queue:
@@ -107,11 +124,31 @@ class Music(commands.Cog):
             return
 
         player.current = player.queue.popleft()
-        source = discord.PCMVolumeTransformer(
-            discord.FFmpegPCMAudio(player.current.stream_url, **FFMPEG_OPTIONS),
-            volume=player.volume,
+        asyncio.run_coroutine_threadsafe(
+            self._play_song(guild, player, player.current), self.bot.loop
         )
-        guild.voice_client.play(source, after=lambda e: self.play_next(guild))
+
+    async def _play_song(self, guild: discord.Guild, player: GuildPlayer, song: Song):
+        """Get a fresh stream URL and start playing."""
+        vc = guild.voice_client
+        if not vc or not vc.is_connected():
+            return
+
+        stream_url = await self.get_stream_url(song)
+        if not stream_url:
+            logger.error("Could not get stream URL for: %s", song.title)
+            self.play_next(guild)
+            return
+
+        try:
+            source = discord.PCMVolumeTransformer(
+                discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS),
+                volume=player.volume,
+            )
+            vc.play(source, after=lambda e: self.play_next(guild, e))
+        except Exception:
+            logger.exception("Failed to play: %s", song.title)
+            self.play_next(guild)
 
     async def auto_disconnect(self, guild: discord.Guild):
         """Disconnect after 3 minutes of inactivity."""
@@ -125,7 +162,7 @@ class Music(commands.Cog):
     def create_now_playing_embed(self, song: Song) -> discord.Embed:
         embed = discord.Embed(
             title="Now Playing",
-            description=f"[{song.title}]({song.url})",
+            description=f"[{song.title}]({song.webpage_url})",
             color=discord.Color.green(),
         )
         embed.add_field(name="Duration", value=song.duration_str, inline=True)
@@ -181,7 +218,7 @@ class Music(commands.Cog):
             player.queue.append(song)
             embed = discord.Embed(
                 title="Added to Queue",
-                description=f"[{song.title}]({song.url})",
+                description=f"[{song.title}]({song.webpage_url})",
                 color=discord.Color.blue(),
             )
             embed.add_field(name="Position", value=str(len(player.queue)), inline=True)
@@ -189,12 +226,20 @@ class Music(commands.Cog):
             await interaction.followup.send(embed=embed)
         else:
             player.current = song
-            source = discord.PCMVolumeTransformer(
-                discord.FFmpegPCMAudio(song.stream_url, **FFMPEG_OPTIONS),
-                volume=player.volume,
-            )
-            vc.play(source, after=lambda e: self.play_next(interaction.guild))
-            await interaction.followup.send(embed=self.create_now_playing_embed(song))
+            stream_url = await self.get_stream_url(song)
+            if not stream_url:
+                await interaction.followup.send("Could not get audio stream. Try again.")
+                return
+            try:
+                source = discord.PCMVolumeTransformer(
+                    discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS),
+                    volume=player.volume,
+                )
+                vc.play(source, after=lambda e: self.play_next(interaction.guild, e))
+                await interaction.followup.send(embed=self.create_now_playing_embed(song))
+            except Exception as exc:
+                logger.exception("Failed to start playback")
+                await interaction.followup.send(f"Playback error: {exc}")
 
     @app_commands.command(name="pause", description="Pause the current song")
     async def pause(self, interaction: discord.Interaction):
@@ -253,14 +298,14 @@ class Music(commands.Cog):
         if player.current:
             embed.add_field(
                 name="Now Playing",
-                value=f"[{player.current.title}]({player.current.url}) — {player.current.duration_str}",
+                value=f"[{player.current.title}]({player.current.webpage_url}) — {player.current.duration_str}",
                 inline=False,
             )
 
         if player.queue:
             queue_list = []
             for i, song in enumerate(player.queue, start=1):
-                queue_list.append(f"`{i}.` [{song.title}]({song.url}) — {song.duration_str}")
+                queue_list.append(f"`{i}.` [{song.title}]({song.webpage_url}) — {song.duration_str}")
                 if i >= 10:
                     remaining = len(player.queue) - 10
                     if remaining > 0:
@@ -336,7 +381,7 @@ class Music(commands.Cog):
                 player.queue.append(song)
                 embed = discord.Embed(
                     title="Added to Queue",
-                    description=f"[{song.title}]({song.url})",
+                    description=f"[{song.title}]({song.webpage_url})",
                     color=discord.Color.blue(),
                 )
                 embed.add_field(name="Position", value=str(len(player.queue)), inline=True)
@@ -344,12 +389,20 @@ class Music(commands.Cog):
                 await ctx.send(embed=embed)
             else:
                 player.current = song
-                source = discord.PCMVolumeTransformer(
-                    discord.FFmpegPCMAudio(song.stream_url, **FFMPEG_OPTIONS),
-                    volume=player.volume,
-                )
-                vc.play(source, after=lambda e: self.play_next(ctx.guild))
-                await ctx.send(embed=self.create_now_playing_embed(song))
+                stream_url = await self.get_stream_url(song)
+                if not stream_url:
+                    await ctx.send("Could not get audio stream. Try again.")
+                    return
+                try:
+                    source = discord.PCMVolumeTransformer(
+                        discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS),
+                        volume=player.volume,
+                    )
+                    vc.play(source, after=lambda e: self.play_next(ctx.guild, e))
+                    await ctx.send(embed=self.create_now_playing_embed(song))
+                except Exception as exc:
+                    logger.exception("Failed to start playback")
+                    await ctx.send(f"Playback error: {exc}")
 
     @commands.command(name="pause")
     async def pause_prefix(self, ctx: commands.Context):
@@ -402,13 +455,13 @@ class Music(commands.Cog):
         if player.current:
             embed.add_field(
                 name="Now Playing",
-                value=f"[{player.current.title}]({player.current.url}) — {player.current.duration_str}",
+                value=f"[{player.current.title}]({player.current.webpage_url}) — {player.current.duration_str}",
                 inline=False,
             )
         if player.queue:
             queue_list = []
             for i, song in enumerate(player.queue, start=1):
-                queue_list.append(f"`{i}.` [{song.title}]({song.url}) — {song.duration_str}")
+                queue_list.append(f"`{i}.` [{song.title}]({song.webpage_url}) — {song.duration_str}")
                 if i >= 10:
                     remaining = len(player.queue) - 10
                     if remaining > 0:
