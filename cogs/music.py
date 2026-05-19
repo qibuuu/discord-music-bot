@@ -353,8 +353,9 @@ class Music(commands.Cog):
                 )
                 vc.play(source, after=lambda e: self.play_next(interaction.guild, e))
                 embed = self.create_now_playing_embed(song)
-                await interaction.followup.send(
-                    embed=embed, view=self.player_view, ephemeral=True
+                await interaction.followup.send("🎵 Playing!", ephemeral=True)
+                await interaction.channel.send(
+                    embed=embed, view=self.player_view
                 )
             except Exception as exc:
                 logger.exception("Failed to start playback")
@@ -445,7 +446,6 @@ class Music(commands.Cog):
             await interaction.response.send_message(
                 embed=self.create_now_playing_embed(player.current),
                 view=self.player_view,
-                ephemeral=True,
             )
         else:
             await interaction.response.send_message("Nothing is playing.", ephemeral=True)
@@ -556,9 +556,7 @@ class Music(commands.Cog):
                     )
                     vc.play(source, after=lambda e: self.play_next(ctx.guild, e))
                     embed = self.create_now_playing_embed(song)
-                    await ctx.send(
-                        embed=embed, view=self.player_view, delete_after=DELETE_AFTER
-                    )
+                    await ctx.send(embed=embed, view=self.player_view)
                 except Exception as exc:
                     logger.exception("Failed to start playback")
                     await ctx.send(
@@ -641,7 +639,6 @@ class Music(commands.Cog):
             await ctx.send(
                 embed=self.create_now_playing_embed(player.current),
                 view=self.player_view,
-                delete_after=DELETE_AFTER,
             )
         else:
             await ctx.send("Nothing is playing.", delete_after=DELETE_AFTER)
